@@ -6,11 +6,11 @@ public final class MagicStick extends JavaPlugin {
 
     @Override
     public void onEnable() {
-        // Plugin startup logic
+        getLogger().info("Привет! Гондон!");
     }
 
     @Override
     public void onDisable() {
-        // Plugin shutdown logic
+        getLogger().info("Плагин выключен.");
     }
 }
