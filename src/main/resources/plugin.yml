@@ -1,6 +1,19 @@
 name: MagicStick
 version: '${version}'
-
 main: com.magic.magicStick.MagicStick
 api-version: '26.3'
 load: POSTWORLD
+
+commands:
+  getstick:
+    description: Выдает волшебную земляную палочку
+    aliases:
+      - magicstick
+      - dirtstick
+    usage: /<command> [игрок]
+    permission: magicstick.use
+
+permissions:
+  magicstick.use:
+    description: Разрешает получение волшебной палочки
+    default: true

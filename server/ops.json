@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "uuid": "a7f97018-6f75-3e87-a6af-af72486f33e4",
+    "name": "pat1fai",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  }
+]
