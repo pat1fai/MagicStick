@@ -1,2 +1,6 @@
 /.idea/
 /target/
+/server/world
+/server/logs
+/server/usercache.json
+/server/whitelist.json
