@@ -1,0 +1,6 @@
+name: MagicStick
+version: '${version}'
+
+main: com.magic.magicStick.MagicStick
+api-version: '26.3'
+load: POSTWORLD
