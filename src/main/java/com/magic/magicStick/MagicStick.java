@@ -30,11 +30,14 @@ import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.util.Vector;
 
@@ -50,19 +53,47 @@ import java.util.UUID;
 public final class MagicStick extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     public enum WandMode {
-        DIRT("Бросок земли", NamedTextColor.GOLD, "Стреляет блоками земли", "Временная стена укрытия"),
-        WIND("Порыв ветра", NamedTextColor.AQUA, "Шлейф ветра (отталкивание)", "Взлет в воздух (ветряной прыжок)");
+        DIRT(
+                "Стихия Земли",
+                NamedTextColor.GOLD,
+                "Стреляет блоками земли",
+                "Временная стена укрытия",
+                "Стойкость I (сопротивление урону)"
+        ),
+        WIND(
+                "Стихия Воздуха",
+                NamedTextColor.AQUA,
+                "Шлейф ветра (отталкивание)",
+                "Взлет в воздух (ветряной прыжок)",
+                "Скорость I и Прыгучесть I"
+        ),
+        FIRE(
+                "Стихия Огня",
+                NamedTextColor.RED,
+                "Огненный шар (взрыв и поджог)",
+                "Огненный рывок (стремительный дэш)",
+                "Огнестойкость (иммунитет к огню и лаве)"
+        ),
+        WATER(
+                "Стихия Воды",
+                NamedTextColor.BLUE,
+                "Водная струя (пронзание и замедление)",
+                "Приливная волна (исцеление и очищение)",
+                "Подводное дыхание, грация дельфина и автотушение"
+        );
 
         private final String displayName;
         private final NamedTextColor color;
         private final String rmbDescription;
         private final String lmbDescription;
+        private final String passiveDescription;
 
-        WandMode(String displayName, NamedTextColor color, String rmbDescription, String lmbDescription) {
+        WandMode(String displayName, NamedTextColor color, String rmbDescription, String lmbDescription, String passiveDescription) {
             this.displayName = displayName;
             this.color = color;
             this.rmbDescription = rmbDescription;
             this.lmbDescription = lmbDescription;
+            this.passiveDescription = passiveDescription;
         }
 
         public String getDisplayName() {
@@ -81,6 +112,10 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
             return lmbDescription;
         }
 
+        public String getPassiveDescription() {
+            return passiveDescription;
+        }
+
         public WandMode next() {
             WandMode[] values = values();
             return values[(ordinal() + 1) % values.length];
@@ -95,7 +130,14 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
                     return mode;
                 }
             }
-            return DIRT;
+            String lower = name.toLowerCase();
+            return switch (lower) {
+                case "dirt", "earth", "земля", "блок", "бросок земли", "стихия земли" -> DIRT;
+                case "wind", "air", "ветер", "воздух", "порыв ветра", "стихия воздуха" -> WIND;
+                case "fire", "огонь", "пламя", "огненный", "стихия огня" -> FIRE;
+                case "water", "вода", "аква", "водный", "стихия воды" -> WATER;
+                default -> DIRT;
+            };
         }
     }
 
@@ -105,12 +147,17 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
     // Временные блоки созданных стен земли (Блок -> Исходное состояние)
     private final Map<Block, BlockData> temporaryWallBlocks = new HashMap<>();
 
-    // Игроки, защищенные от урона при падении после ветряного прыжка
+    // Игроки, защищенные от урона при падении (после прыжка ветра или огненного рывка)
     private final Set<UUID> fallImmunePlayers = new HashSet<>();
 
     // Кулдауны на спец-способности (ЛКМ)
     private final Map<UUID, Long> wallCooldowns = new HashMap<>();
     private final Map<UUID, Long> jumpCooldowns = new HashMap<>();
+    private final Map<UUID, Long> fireDashCooldowns = new HashMap<>();
+    private final Map<UUID, Long> waterWaveCooldowns = new HashMap<>();
+
+    // Фоновая задача пассивных эффектов стихий
+    private BukkitRunnable passiveTask;
 
     @Override
     public void onEnable() {
@@ -127,11 +174,18 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
             command.setTabCompleter(this);
         }
 
-        getLogger().info("MagicStick успешно включен!");
+        // Запуск пассивных эффектов при удержании палочки в руке
+        startPassiveTask();
+
+        getLogger().info("MagicStick успешно включен со всеми 4 стихиями!");
     }
 
     @Override
     public void onDisable() {
+        if (passiveTask != null) {
+            passiveTask.cancel();
+        }
+
         // Восстанавливаем все временные блоки стен при выключении плагина
         for (Map.Entry<Block, BlockData> entry : temporaryWallBlocks.entrySet()) {
             Block b = entry.getKey();
@@ -143,6 +197,8 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
         fallImmunePlayers.clear();
         wallCooldowns.clear();
         jumpCooldowns.clear();
+        fireDashCooldowns.clear();
+        waterWaveCooldowns.clear();
 
         getLogger().info("MagicStick выключен!");
     }
@@ -166,20 +222,23 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
         }
 
         meta.displayName(
-                Component.text("Волшебная палочка", mode.getColor())
-                        .decorate(TextDecoration.BOLD)
+                Component.text("Волшебная палочка: ", NamedTextColor.WHITE)
+                        .append(Component.text(mode.getDisplayName(), mode.getColor()).decorate(TextDecoration.BOLD))
         );
 
         List<Component> lore = new ArrayList<>();
-        lore.add(Component.text("Текущий режим: ", NamedTextColor.GRAY)
+        lore.add(Component.text("Текущая стихия: ", NamedTextColor.GRAY)
                 .append(Component.text(mode.getDisplayName(), mode.getColor()).decorate(TextDecoration.BOLD)));
         lore.add(Component.empty());
         lore.add(Component.text("ПКМ: ", NamedTextColor.YELLOW)
                 .append(Component.text(mode.getRmbDescription(), NamedTextColor.WHITE)));
         lore.add(Component.text("ЛКМ: ", NamedTextColor.GREEN)
                 .append(Component.text(mode.getLmbDescription(), NamedTextColor.WHITE)));
-        lore.add(Component.text("Shift + ПКМ: ", NamedTextColor.LIGHT_PURPLE)
-                .append(Component.text("Сменить способность", NamedTextColor.GRAY)));
+        lore.add(Component.text("Пассивно: ", NamedTextColor.AQUA)
+                .append(Component.text(mode.getPassiveDescription(), NamedTextColor.WHITE)));
+        lore.add(Component.empty());
+        lore.add(Component.text("Shift + ПКМ / [F]: ", NamedTextColor.LIGHT_PURPLE)
+                .append(Component.text("Сменить стихию", NamedTextColor.GRAY)));
 
         meta.lore(lore);
         meta.setEnchantmentGlintOverride(true);
@@ -227,11 +286,112 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
             Component displayName = meta.displayName();
             if (displayName != null) {
                 String str = displayName.toString();
-                return str.contains("палочка") || str.contains("Земляная палочка");
+                return str.contains("палочка") || str.contains("Земляная палочка") || str.contains("Палочка");
             }
         }
 
         return false;
+    }
+
+    /**
+     * Переключает стихию палочки с аудио-визуальными эффектами
+     */
+    public void cycleMode(Player player, ItemStack item) {
+        if (player.hasCooldown(Material.STICK)) {
+            return;
+        }
+        player.setCooldown(Material.STICK, 4);
+
+        WandMode currentMode = getMode(item);
+        WandMode nextMode = currentMode.next();
+        applyModeToItem(item, nextMode);
+
+        Location eye = player.getEyeLocation();
+        World world = player.getWorld();
+
+        switch (nextMode) {
+            case DIRT -> {
+                world.playSound(eye, Sound.BLOCK_ROOTED_DIRT_BREAK, 1.0f, 1.0f);
+                world.playSound(eye, Sound.BLOCK_ENCHANTMENT_TABLE_USE, 0.8f, 1.0f);
+                world.spawnParticle(Particle.BLOCK, eye, 15, 0.25, 0.25, 0.25, 0.05, Material.DIRT.createBlockData());
+            }
+            case WIND -> {
+                world.playSound(eye, Sound.ENTITY_BREEZE_WIND_BURST, 1.0f, 1.3f);
+                world.playSound(eye, Sound.ENTITY_WIND_CHARGE_THROW, 0.8f, 1.4f);
+                world.spawnParticle(Particle.GUST_EMITTER_SMALL, eye, 1);
+                world.spawnParticle(Particle.SMALL_GUST, eye, 8, 0.25, 0.25, 0.25, 0.05);
+            }
+            case FIRE -> {
+                world.playSound(eye, Sound.ITEM_FIRECHARGE_USE, 1.0f, 1.2f);
+                world.playSound(eye, Sound.ENTITY_BLAZE_SHOOT, 0.8f, 1.3f);
+                world.spawnParticle(Particle.FLAME, eye, 16, 0.25, 0.25, 0.25, 0.05);
+                world.spawnParticle(Particle.LAVA, eye, 4, 0.2, 0.2, 0.2, 0.0);
+            }
+            case WATER -> {
+                world.playSound(eye, Sound.ITEM_BUCKET_EMPTY, 1.0f, 1.2f);
+                world.playSound(eye, Sound.ENTITY_PLAYER_SPLASH_HIGH_SPEED, 0.8f, 1.4f);
+                world.spawnParticle(Particle.SPLASH, eye, 20, 0.25, 0.25, 0.25, 0.1);
+                world.spawnParticle(Particle.BUBBLE_POP, eye, 8, 0.25, 0.25, 0.25, 0.05);
+            }
+        }
+
+        player.sendActionBar(
+                Component.text("Стихия выбрана: ", NamedTextColor.GRAY)
+                        .append(Component.text(nextMode.getDisplayName(), nextMode.getColor()).decorate(TextDecoration.BOLD))
+        );
+    }
+
+    /**
+     * Фоновая задача пассивных способностей стихий
+     */
+    private void startPassiveTask() {
+        passiveTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    ItemStack main = player.getInventory().getItemInMainHand();
+                    ItemStack off = player.getInventory().getItemInOffHand();
+
+                    ItemStack stick = isMagicStick(main) ? main : (isMagicStick(off) ? off : null);
+                    if (stick == null) {
+                        continue;
+                    }
+
+                    WandMode mode = getMode(stick);
+                    World world = player.getWorld();
+                    Location loc = player.getLocation();
+
+                    switch (mode) {
+                        case DIRT -> {
+                            player.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, 40, 0, false, false, true));
+                            world.spawnParticle(Particle.DUST_PLUME, loc.clone().add(0, 0.1, 0), 1, 0.2, 0.0, 0.2, 0.0);
+                        }
+                        case WIND -> {
+                            player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 40, 0, false, false, true));
+                            player.addPotionEffect(new PotionEffect(PotionEffectType.JUMP_BOOST, 40, 0, false, false, true));
+                            world.spawnParticle(Particle.SMALL_GUST, loc.clone().add(0, 0.1, 0), 1, 0.2, 0.0, 0.2, 0.0);
+                        }
+                        case FIRE -> {
+                            player.addPotionEffect(new PotionEffect(PotionEffectType.FIRE_RESISTANCE, 40, 0, false, false, true));
+                            world.spawnParticle(Particle.SMALL_FLAME, loc.clone().add(0, 0.1, 0), 2, 0.25, 0.05, 0.25, 0.0);
+                        }
+                        case WATER -> {
+                            player.addPotionEffect(new PotionEffect(PotionEffectType.WATER_BREATHING, 40, 0, false, false, true));
+                            player.addPotionEffect(new PotionEffect(PotionEffectType.DOLPHINS_GRACE, 40, 0, false, false, true));
+                            world.spawnParticle(Particle.DRIPPING_WATER, loc.clone().add(0, 1.4, 0), 1, 0.2, 0.0, 0.2, 0.0);
+
+                            // Автоматическое тушение игрока при воспламенении
+                            if (player.getFireTicks() > 0) {
+                                player.setFireTicks(0);
+                                world.playSound(loc, Sound.BLOCK_FIRE_EXTINGUISH, 0.6f, 1.4f);
+                                world.spawnParticle(Particle.SPLASH, loc.clone().add(0, 1.0, 0), 10, 0.25, 0.25, 0.25, 0.05);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        passiveTask.runTaskTimer(this, 20L, 20L);
     }
 
     @Override
@@ -246,7 +406,7 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
 
         if (args.length == 0) {
             if (!(sender instanceof Player playerSender)) {
-                sender.sendMessage(Component.text("Использование из консоли: /" + label + " <игрок> [dirt|wind]", NamedTextColor.RED));
+                sender.sendMessage(Component.text("Использование из консоли: /" + label + " <игрок> [dirt|wind|fire|water]", NamedTextColor.RED));
                 return true;
             }
             target = playerSender;
@@ -296,9 +456,27 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
                     modes.add(m.name().toLowerCase());
                 }
             }
+            for (String aliasMode : List.of("earth", "air", "fire", "water")) {
+                if (aliasMode.startsWith(prefix) && !modes.contains(aliasMode)) {
+                    modes.add(aliasMode);
+                }
+            }
             return modes;
         }
         return Collections.emptyList();
+    }
+
+    /**
+     * Быстрая смена стихии на клавишу 'F' (Swap Hand)
+     */
+    @EventHandler
+    public void onSwapHandItems(PlayerSwapHandItemsEvent event) {
+        Player player = event.getPlayer();
+        ItemStack mainItem = player.getInventory().getItemInMainHand();
+        if (isMagicStick(mainItem)) {
+            event.setCancelled(true);
+            cycleMode(player, mainItem);
+        }
     }
 
     @EventHandler
@@ -326,47 +504,30 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
             return;
         }
 
-        // Смена способности при зажатом Shift + ПКМ (или Shift + ЛКМ)
+        // Смена способности при зажатом Shift + ПКМ
         if (player.isSneaking() && isRightClick) {
             event.setCancelled(true);
-
-            if (player.hasCooldown(Material.STICK)) {
-                return;
-            }
-            player.setCooldown(Material.STICK, 4);
-
-            WandMode currentMode = getMode(item);
-            WandMode nextMode = currentMode.next();
-            applyModeToItem(item, nextMode);
-
-            // Звуки и эффекты переключения
-            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.4f);
-            player.playSound(player.getLocation(), Sound.BLOCK_ENCHANTMENT_TABLE_USE, 0.7f, 1.2f);
-            player.getWorld().spawnParticle(Particle.ENCHANT, player.getEyeLocation(), 12, 0.25, 0.25, 0.25, 0.1);
-
-            player.sendActionBar(
-                    Component.text("Выбран режим: ", NamedTextColor.GRAY)
-                            .append(Component.text(nextMode.getDisplayName(), nextMode.getColor()).decorate(TextDecoration.BOLD))
-            );
+            cycleMode(player, item);
             return;
         }
 
-        // --- ЛКМ (Вторая способность: Стена укрытия / Взлет вверх) ---
+        // --- ЛКМ (Вторая тактическая способность для каждой стихии) ---
         if (isLeftClick) {
             if (event.getAction() == Action.LEFT_CLICK_BLOCK) {
                 event.setCancelled(true);
             }
 
             WandMode mode = getMode(item);
-            if (mode == WandMode.DIRT) {
-                createDirtWall(player);
-            } else if (mode == WandMode.WIND) {
-                windJump(player);
+            switch (mode) {
+                case DIRT -> createDirtWall(player);
+                case WIND -> windJump(player);
+                case FIRE -> flameDash(player);
+                case WATER -> cleanseWave(player);
             }
             return;
         }
 
-        // --- ПКМ (Основная способность: Бросок земли / Шлейф ветра) ---
+        // --- ПКМ (Основная боевая способность для каждой стихии) ---
         if (isRightClick) {
             if (event.getAction() == Action.RIGHT_CLICK_BLOCK) {
                 event.setCancelled(true);
@@ -377,18 +538,29 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
             }
 
             WandMode mode = getMode(item);
-            if (mode == WandMode.DIRT) {
-                player.setCooldown(Material.STICK, 30); // ~1.5 сек
-                shootDirt(player);
-            } else if (mode == WandMode.WIND) {
-                player.setCooldown(Material.STICK, 30); // ~1.5 сек
-                shootWind(player);
+            switch (mode) {
+                case DIRT -> {
+                    player.setCooldown(Material.STICK, 30); // 1.5 сек
+                    shootDirt(player);
+                }
+                case WIND -> {
+                    player.setCooldown(Material.STICK, 30); // 1.5 сек
+                    shootWind(player);
+                }
+                case FIRE -> {
+                    player.setCooldown(Material.STICK, 30); // 1.5 сек
+                    shootFireball(player);
+                }
+                case WATER -> {
+                    player.setCooldown(Material.STICK, 25); // 1.25 сек
+                    shootWaterStream(player);
+                }
             }
         }
     }
 
     /**
-     * Способность 1 (ПКМ): Стреляет блоком земли от лица игрока
+     * Стихия Земли (ПКМ): Стреляет блоком земли от лица игрока
      */
     private void shootDirt(Player player) {
         Location eyeLoc = player.getEyeLocation();
@@ -460,7 +632,7 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
     }
 
     /**
-     * Способность 1 (ЛКМ): Создает временную защитную стену из земли (3x3 на 6 секунд)
+     * Стихия Земли (ЛКМ): Создает временную защитную стену из земли (3x3 на 6 секунд)
      */
     private void createDirtWall(Player player) {
         long now = System.currentTimeMillis();
@@ -523,7 +695,6 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
                         currentWall.put(b, b.getBlockData());
                         temporaryWallBlocks.put(b, b.getBlockData());
 
-                        // Чередование блоков земли для приятной текстуры
                         if ((w + h) % 2 == 0) {
                             b.setType(Material.DIRT);
                         } else {
@@ -571,7 +742,7 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
     }
 
     /**
-     * Способность 2 (ПКМ): Шлейф ветра, сдувающий существ от игрока
+     * Стихия Воздуха (ПКМ): Шлейф ветра, сдувающий существ от игрока
      */
     private void shootWind(Player player) {
         Location startLoc = player.getEyeLocation().clone().subtract(0, 0.2, 0);
@@ -643,13 +814,19 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
                     pushVec.normalize();
 
                     pushVec.add(direction.clone().multiply(1.4)).normalize();
-                    pushVec.multiply(1.9).setY(0.48);
+
+                    // Синергия стихий: если враг намочен/замедлен водой, отлетает в 1.5 раза дальше!
+                    boolean isSlowed = target.hasPotionEffect(PotionEffectType.SLOWNESS);
+                    double multiplier = isSlowed ? 2.8 : 1.9;
+                    double yBoost = isSlowed ? 0.6 : 0.48;
+
+                    pushVec.multiply(multiplier).setY(yBoost);
                     target.setVelocity(pushVec);
 
                     target.damage(2.0, player);
 
                     world.playSound(target.getLocation(), Sound.ENTITY_WIND_CHARGE_WIND_BURST, 1.1f, 1.3f);
-                    world.spawnParticle(Particle.GUST_EMITTER_SMALL, target.getLocation().add(0, 1.0, 0), 1);
+                    world.spawnParticle(isSlowed ? Particle.GUST_EMITTER_LARGE : Particle.GUST_EMITTER_SMALL, target.getLocation().add(0, 1.0, 0), 1);
                     world.spawnParticle(Particle.CLOUD, target.getLocation().add(0, 1.0, 0), 10, 0.35, 0.35, 0.35, 0.08);
                 }
 
@@ -659,7 +836,7 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
     }
 
     /**
-     * Способность 2 (ЛКМ): Подлет вверх с помощью порыва ветра под ногами и защитой от падения
+     * Стихия Воздуха (ЛКМ): Подлет вверх с помощью порыва ветра под ногами и защитой от падения
      */
     private void windJump(Player player) {
         long now = System.currentTimeMillis();
@@ -716,6 +893,414 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
         }
     }
 
+    /**
+     * Стихия Огня (ПКМ): Стремительный огненный шар, взрывающийся при попадании
+     */
+    private void shootFireball(Player player) {
+        Location startLoc = player.getEyeLocation().clone().subtract(0, 0.15, 0);
+        Vector direction = player.getEyeLocation().getDirection().normalize();
+        World world = player.getWorld();
+
+        world.playSound(startLoc, Sound.ENTITY_BLAZE_SHOOT, 1.2f, 1.0f);
+        world.playSound(startLoc, Sound.ITEM_FIRECHARGE_USE, 1.0f, 1.1f);
+        world.spawnParticle(Particle.FLAME, startLoc, 8, 0.1, 0.1, 0.1, 0.05);
+
+        new BukkitRunnable() {
+            int ticks = 0;
+            final int maxTicks = 35; // до 50 блоков
+            Location currentLoc = startLoc.clone();
+            final double speed = 1.5;
+
+            @Override
+            public void run() {
+                if (ticks++ > maxTicks) {
+                    cancel();
+                    return;
+                }
+
+                currentLoc.add(direction.clone().multiply(speed));
+
+                // Частицы летящего огненного снаряда
+                world.spawnParticle(Particle.FLAME, currentLoc, 4, 0.08, 0.08, 0.08, 0.01);
+                world.spawnParticle(Particle.SMALL_FLAME, currentLoc, 3, 0.05, 0.05, 0.05, 0.01);
+                world.spawnParticle(Particle.SMOKE, currentLoc, 1, 0.02, 0.02, 0.02, 0.0);
+
+                Block block = currentLoc.getBlock();
+                boolean hitBlock = block.getType().isSolid();
+
+                LivingEntity hitTarget = null;
+                for (Entity entity : world.getNearbyEntities(currentLoc, 1.2, 1.2, 1.2)) {
+                    if (entity instanceof LivingEntity target && !target.getUniqueId().equals(player.getUniqueId())) {
+                        if (target instanceof Player p && (p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR)) {
+                            continue;
+                        }
+                        if (target.isInvulnerable()) {
+                            continue;
+                        }
+                        hitTarget = target;
+                        break;
+                    }
+                }
+
+                if (hitBlock || hitTarget != null) {
+                    explodeFireball(currentLoc, player);
+                    cancel();
+                }
+            }
+        }.runTaskTimer(this, 1L, 1L);
+    }
+
+    /**
+     * Взрыв огненного шара с взаимодействием с окружением и врагами
+     */
+    private void explodeFireball(Location loc, Player player) {
+        World world = loc.getWorld();
+
+        world.playSound(loc, Sound.ENTITY_GENERIC_EXPLODE, 0.9f, 1.3f);
+        world.playSound(loc, Sound.ITEM_FIRECHARGE_USE, 1.2f, 0.8f);
+
+        world.spawnParticle(Particle.EXPLOSION, loc, 1);
+        world.spawnParticle(Particle.FLAME, loc, 25, 0.5, 0.5, 0.5, 0.1);
+        world.spawnParticle(Particle.LAVA, loc, 8, 0.35, 0.35, 0.35, 0.0);
+        world.spawnParticle(Particle.CAMPFIRE_COSY_SMOKE, loc, 6, 0.3, 0.3, 0.3, 0.03);
+
+        Block centerBlock = loc.getBlock();
+
+        // Взаимодействие с миром: растапливание снега и льда
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    Block b = centerBlock.getRelative(dx, dy, dz);
+                    if (b.getType() == Material.ICE) {
+                        b.setType(Material.WATER);
+                    } else if (b.getType() == Material.SNOW || b.getType() == Material.SNOW_BLOCK) {
+                        b.setType(Material.AIR);
+                    }
+                }
+            }
+        }
+
+        // Взаимодействие со стеной земли: раскаленные осколки магмы!
+        boolean hitWall = false;
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    Block b = centerBlock.getRelative(dx, dy, dz);
+                    if (temporaryWallBlocks.containsKey(b)) {
+                        hitWall = true;
+                        break;
+                    }
+                }
+                if (hitWall) break;
+            }
+            if (hitWall) break;
+        }
+
+        if (hitWall) {
+            world.playSound(loc, Sound.BLOCK_LAVA_EXTINGUISH, 1.2f, 0.9f);
+            world.spawnParticle(Particle.LAVA, loc, 16, 0.6, 0.6, 0.6, 0.1);
+        }
+
+        double radius = hitWall ? 3.5 : 2.8;
+        double baseDamage = hitWall ? 8.0 : 6.0;
+
+        for (Entity entity : world.getNearbyEntities(loc, radius, radius, radius)) {
+            if (!(entity instanceof LivingEntity target) || target.getUniqueId().equals(player.getUniqueId())) {
+                continue;
+            }
+            if (target instanceof Player p && (p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR)) {
+                continue;
+            }
+            if (target.isInvulnerable()) {
+                continue;
+            }
+
+            target.damage(baseDamage, player);
+            target.setFireTicks(100); // 5 секунд горения
+
+            Vector push = target.getLocation().toVector().subtract(loc.toVector());
+            if (push.lengthSquared() < 0.01) {
+                push = new Vector(0, 0.3, 0);
+            } else {
+                push.normalize().multiply(0.7).setY(0.3);
+            }
+            target.setVelocity(target.getVelocity().add(push));
+        }
+    }
+
+    /**
+     * Стихия Огня (ЛКМ): Стремительный огненный рывок сквозь врагов
+     */
+    private void flameDash(Player player) {
+        long now = System.currentTimeMillis();
+        long lastUse = fireDashCooldowns.getOrDefault(player.getUniqueId(), 0L);
+        long cooldownMillis = 5000L; // 5 секунд кулдаун
+
+        if (now - lastUse < cooldownMillis) {
+            long remainingSec = (cooldownMillis - (now - lastUse) + 999) / 1000;
+            player.sendActionBar(Component.text("Огненный рывок перезаряжается: " + remainingSec + " сек.", NamedTextColor.RED));
+            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.5f, 0.6f);
+            return;
+        }
+
+        fireDashCooldowns.put(player.getUniqueId(), now);
+        player.setCooldown(Material.STICK, 15);
+
+        World world = player.getWorld();
+        Location loc = player.getLocation();
+
+        // Импульс рывка вперед
+        Vector dir = loc.getDirection();
+        Vector dashVec = dir.clone().multiply(1.8).setY(Math.max(0.18, dir.getY() * 0.4 + 0.18));
+        player.setVelocity(dashVec);
+
+        // Временная защита от урона при падении
+        fallImmunePlayers.add(player.getUniqueId());
+        Bukkit.getScheduler().runTaskLater(this, () -> fallImmunePlayers.remove(player.getUniqueId()), 120L);
+
+        world.playSound(loc, Sound.ENTITY_FIREWORK_ROCKET_BLAST, 1.2f, 0.8f);
+        world.playSound(loc, Sound.ITEM_FIRECHARGE_USE, 1.3f, 1.1f);
+        world.spawnParticle(Particle.FLAME, loc, 20, 0.4, 0.4, 0.4, 0.08);
+
+        player.sendActionBar(Component.text("Огненный рывок!", NamedTextColor.RED));
+
+        Set<UUID> hitTargets = new HashSet<>();
+
+        // Огненный след за игроком и урон врагам по пути
+        new BukkitRunnable() {
+            int ticks = 0;
+
+            @Override
+            public void run() {
+                if (ticks++ > 8 || !player.isOnline()) {
+                    cancel();
+                    return;
+                }
+
+                Location pLoc = player.getLocation().add(0, 0.4, 0);
+                world.spawnParticle(Particle.FLAME, pLoc, 10, 0.3, 0.3, 0.3, 0.04);
+                world.spawnParticle(Particle.SOUL_FIRE_FLAME, pLoc, 3, 0.2, 0.2, 0.2, 0.02);
+                world.spawnParticle(Particle.SMOKE, pLoc, 4, 0.2, 0.2, 0.2, 0.02);
+
+                for (Entity entity : world.getNearbyEntities(pLoc, 1.8, 1.8, 1.8)) {
+                    if (entity instanceof LivingEntity target && !target.getUniqueId().equals(player.getUniqueId())) {
+                        if (target instanceof Player p && (p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR)) {
+                            continue;
+                        }
+                        if (target.isInvulnerable() || hitTargets.contains(target.getUniqueId())) {
+                            continue;
+                        }
+
+                        hitTargets.add(target.getUniqueId());
+                        target.damage(5.0, player);
+                        target.setFireTicks(80); // 4 сек огня
+                        target.setVelocity(target.getVelocity().add(dir.clone().multiply(0.5).setY(0.25)));
+
+                        world.playSound(target.getLocation(), Sound.ENTITY_BLAZE_HURT, 1.0f, 1.2f);
+                        world.spawnParticle(Particle.LAVA, target.getLocation().add(0, 1.0, 0), 4, 0.2, 0.2, 0.2, 0.0);
+                    }
+                }
+            }
+        }.runTaskTimer(this, 1L, 1L);
+    }
+
+    /**
+     * Стихия Воды (ПКМ): Пронзающая водная струя с замедлением и реакцией 'Испарение'
+     */
+    private void shootWaterStream(Player player) {
+        Location startLoc = player.getEyeLocation().clone().subtract(0, 0.2, 0);
+        Vector direction = player.getEyeLocation().getDirection().normalize();
+        World world = player.getWorld();
+
+        world.playSound(startLoc, Sound.ENTITY_PLAYER_SPLASH_HIGH_SPEED, 1.2f, 1.2f);
+        world.playSound(startLoc, Sound.ITEM_BUCKET_EMPTY, 0.9f, 1.4f);
+
+        world.spawnParticle(Particle.SPLASH, startLoc, 10, 0.2, 0.2, 0.2, 0.05);
+        world.spawnParticle(Particle.BUBBLE_POP, startLoc, 5, 0.1, 0.1, 0.1, 0.02);
+
+        Set<UUID> hitTargets = new HashSet<>();
+
+        new BukkitRunnable() {
+            int step = 0;
+            final int maxSteps = 16;
+            Location currentLoc = startLoc.clone();
+
+            @Override
+            public void run() {
+                if (step++ >= maxSteps) {
+                    cancel();
+                    return;
+                }
+
+                currentLoc.add(direction.clone().multiply(1.2));
+
+                Block block = currentLoc.getBlock();
+                if (block.getType().isSolid()) {
+                    world.spawnParticle(Particle.SPLASH, currentLoc, 20, 0.3, 0.3, 0.3, 0.1);
+                    world.playSound(currentLoc, Sound.ENTITY_PLAYER_SPLASH, 0.9f, 1.3f);
+                    cancel();
+                    return;
+                }
+
+                // Тушение огня на пути
+                if (block.getType() == Material.FIRE || block.getType() == Material.SOUL_FIRE) {
+                    block.setType(Material.AIR);
+                    world.playSound(currentLoc, Sound.BLOCK_FIRE_EXTINGUISH, 1.0f, 1.2f);
+                }
+
+                // Частицы струи воды
+                world.spawnParticle(Particle.SPLASH, currentLoc, 6, 0.15, 0.15, 0.15, 0.05);
+                world.spawnParticle(Particle.BUBBLE, currentLoc, 3, 0.1, 0.1, 0.1, 0.01);
+                world.spawnParticle(Particle.BUBBLE_POP, currentLoc, 2, 0.1, 0.1, 0.1, 0.01);
+
+                for (Entity entity : world.getNearbyEntities(currentLoc, 1.3, 1.3, 1.3)) {
+                    if (!(entity instanceof LivingEntity target) || target.getUniqueId().equals(player.getUniqueId())) {
+                        continue;
+                    }
+                    if (target instanceof Player p && (p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR)) {
+                        continue;
+                    }
+                    if (target.isInvulnerable() || hitTargets.contains(target.getUniqueId())) {
+                        continue;
+                    }
+
+                    hitTargets.add(target.getUniqueId());
+
+                    boolean wasBurning = target.getFireTicks() > 0;
+
+                    // Базовый урон и замедление
+                    target.damage(5.0, player);
+                    target.setFireTicks(0); // Тушит огонь
+                    target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 60, 1)); // Замедление II на 3 сек
+
+                    Vector pushVec = direction.clone().multiply(0.7).setY(0.2);
+                    target.setVelocity(target.getVelocity().add(pushVec));
+
+                    // Элементальная реакция "Испарение" (Vaporize)
+                    if (wasBurning) {
+                        target.damage(7.0, player); // Дополнительный сокрушительный урон паром!
+                        world.playSound(target.getLocation(), Sound.BLOCK_FIRE_EXTINGUISH, 1.4f, 0.9f);
+                        world.playSound(target.getLocation(), Sound.ENTITY_GENERIC_EXTINGUISH_FIRE, 1.2f, 1.1f);
+                        world.spawnParticle(Particle.CAMPFIRE_COSY_SMOKE, target.getLocation().add(0, 1.0, 0), 16, 0.3, 0.5, 0.3, 0.04);
+                        world.spawnParticle(Particle.POOF, target.getLocation().add(0, 1.0, 0), 8, 0.2, 0.3, 0.2, 0.02);
+
+                        player.sendActionBar(
+                                Component.text("✦ ИСПАРЕНИЕ! +7 к урону паром! ✦", NamedTextColor.AQUA)
+                                        .decorate(TextDecoration.BOLD)
+                        );
+                    }
+
+                    world.playSound(target.getLocation(), Sound.ENTITY_PLAYER_SPLASH, 1.1f, 1.1f);
+                    world.spawnParticle(Particle.SPLASH, target.getLocation().add(0, 1.0, 0), 16, 0.3, 0.4, 0.3, 0.08);
+                }
+            }
+        }.runTaskTimer(this, 1L, 1L);
+    }
+
+    /**
+     * Стихия Воды (ЛКМ): Приливная волна исцеления, очищения и смыва врагов
+     */
+    private void cleanseWave(Player player) {
+        long now = System.currentTimeMillis();
+        long lastUse = waterWaveCooldowns.getOrDefault(player.getUniqueId(), 0L);
+        long cooldownMillis = 6000L; // 6 секунд кулдаун
+
+        if (now - lastUse < cooldownMillis) {
+            long remainingSec = (cooldownMillis - (now - lastUse) + 999) / 1000;
+            player.sendActionBar(Component.text("Приливная волна перезаряжается: " + remainingSec + " сек.", NamedTextColor.RED));
+            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.5f, 0.6f);
+            return;
+        }
+
+        waterWaveCooldowns.put(player.getUniqueId(), now);
+        player.setCooldown(Material.STICK, 20);
+
+        World world = player.getWorld();
+        Location center = player.getLocation();
+
+        // Звуки прилива
+        world.playSound(center, Sound.ITEM_BUCKET_EMPTY, 1.2f, 0.9f);
+        world.playSound(center, Sound.ENTITY_DOLPHIN_SPLASH, 1.3f, 1.1f);
+        world.playSound(center, Sound.ENTITY_PLAYER_SPLASH_HIGH_SPEED, 1.1f, 1.0f);
+
+        // Очищение самого игрока от негативных эффектов и огня
+        player.setFireTicks(0);
+        player.removePotionEffect(PotionEffectType.POISON);
+        player.removePotionEffect(PotionEffectType.WITHER);
+        player.removePotionEffect(PotionEffectType.BLINDNESS);
+        player.removePotionEffect(PotionEffectType.SLOWNESS);
+
+        player.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 80, 1)); // Регенерация II на 4 сек (~3-4 сердца)
+        player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 140, 0));  // Золотые сердца на 7 сек
+
+        player.sendActionBar(Component.text("Приливная волна: Очищение и исцеление!", NamedTextColor.BLUE));
+
+        // Расширяющаяся круговая волна
+        new BukkitRunnable() {
+            int step = 1;
+            final int maxStep = 4;
+
+            @Override
+            public void run() {
+                if (step > maxStep) {
+                    cancel();
+                    return;
+                }
+
+                double radius = step * 1.2; // расширение до 4.8 блоков
+                int points = 24 + step * 8;
+
+                for (int i = 0; i < points; i++) {
+                    double angle = 2 * Math.PI * i / points;
+                    double x = Math.cos(angle) * radius;
+                    double z = Math.sin(angle) * radius;
+                    Location particleLoc = center.clone().add(x, 0.3, z);
+
+                    world.spawnParticle(Particle.SPLASH, particleLoc, 2, 0.1, 0.2, 0.1, 0.05);
+                    world.spawnParticle(Particle.BUBBLE_POP, particleLoc, 1, 0.05, 0.1, 0.05, 0.01);
+                    world.spawnParticle(Particle.BUBBLE_COLUMN_UP, particleLoc, 1, 0.05, 0.1, 0.05, 0.01);
+                }
+
+                step++;
+            }
+        }.runTaskTimer(this, 0L, 1L);
+
+        // Воздействие на окружающих существ
+        for (Entity entity : world.getNearbyEntities(center, 4.8, 3.0, 4.8)) {
+            if (!(entity instanceof LivingEntity target) || target.getUniqueId().equals(player.getUniqueId())) {
+                continue;
+            }
+
+            // Союзные игроки тушатся и получают исцеление
+            if (target instanceof Player ally) {
+                ally.setFireTicks(0);
+                ally.removePotionEffect(PotionEffectType.POISON);
+                ally.removePotionEffect(PotionEffectType.WITHER);
+                ally.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 60, 0));
+                ally.getWorld().playSound(ally.getLocation(), Sound.ENTITY_PLAYER_SPLASH, 0.8f, 1.2f);
+                continue;
+            }
+
+            if (target.isInvulnerable()) {
+                continue;
+            }
+
+            // Враги получают урон, смываются назад и замедляются
+            target.damage(3.0, player);
+            target.setFireTicks(0);
+            target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 80, 0));
+
+            Vector push = target.getLocation().toVector().subtract(center.toVector());
+            if (push.lengthSquared() < 0.01) {
+                push = new Vector(1, 0, 0);
+            }
+            push.setY(0).normalize().multiply(1.5).setY(0.4);
+            target.setVelocity(push);
+
+            world.spawnParticle(Particle.SPLASH, target.getLocation().add(0, 1.0, 0), 12, 0.3, 0.3, 0.3, 0.05);
+        }
+    }
+
     @EventHandler
     public void onEntityChangeBlock(EntityChangeBlockEvent event) {
         if (event.getEntity() instanceof FallingBlock fallingBlock) {
@@ -727,7 +1312,7 @@ public final class MagicStick extends JavaPlugin implements Listener, CommandExe
 
     @EventHandler
     public void onEntityDamage(EntityDamageEvent event) {
-        // Поглощение урона от падения после ветряного прыжка
+        // Поглощение урона от падения после ветряного прыжка или огненного рывка
         if (event.getCause() == EntityDamageEvent.DamageCause.FALL && event.getEntity() instanceof Player player) {
             if (fallImmunePlayers.remove(player.getUniqueId())) {
                 event.setCancelled(true);

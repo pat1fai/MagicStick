@@ -6,11 +6,11 @@ load: POSTWORLD
 
 commands:
   getstick:
-    description: Выдает волшебную земляную палочку
+    description: Выдает стихийную волшебную палочку (Земля, Воздух, Огонь, Вода)
     aliases:
       - magicstick
-      - dirtstick
-    usage: /<command> [игрок]
+      - stick
+    usage: /<command> [игрок] [dirt|wind|fire|water]
     permission: magicstick.use
 
 permissions:
